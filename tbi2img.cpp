@@ -174,7 +174,7 @@ static void seek_output(std::fstream& out,uint64_t pos) {
 static void convert(const fs::path& src,const fs::path& dst,bool verbose) {
     std::ifstream in(src,std::ios::binary); if(!in) throw std::runtime_error("cannot open input"); Metadata m=metadata(in,verbose);
     if(m.encrypted) throw std::runtime_error("encrypted images are not supported");
-    if(m.compression!=0&&m.compression!=14&&m.compression!=15) throw std::runtime_error("unsupported compression option "+std::to_string(m.compression));
+    if(m.compression!=0&&m.compression!=1&&m.compression!=14&&m.compression!=15) throw std::runtime_error("unsupported compression option "+std::to_string(m.compression));
     std::fstream out(dst,std::ios::binary|std::ios::in|std::ios::out|std::ios::trunc); if(!out) throw std::runtime_error("cannot create output");
     uint64_t blocks=0,written=0,max_end=0;
     if(!m.boot_data.empty()) {
