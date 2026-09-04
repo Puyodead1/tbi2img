@@ -104,8 +104,13 @@ static Metadata metadata(std::ifstream& in,bool verbose) {
             if(disk_sector&&m.boot_data.size()>=disk_sector+40&&std::memcmp(m.boot_data.data()+disk_sector,"EFI PART",8)==0)
                 m.disk_size=(le64(m.boot_data.data()+disk_sector+32)+1)*uint64_t(disk_sector);
         }
-        else if(r.type==1&&r.data.size()>=116) {
-            Volume v{le32(r.data.data()+4),le64(r.data.data()+108),le64(r.data.data()+236)};
+        else if(r.type==1&&r.data.size()>=180) {
+            // Legacy 276-byte descriptors are converted internally by moving
+            // bytes 44..275 to offset 108 in the modern 408-byte layout.
+            const bool legacy=r.data.size()<408;
+            const size_t start_off=legacy?44:108;
+            const size_t data_off=legacy?172:236;
+            Volume v{le32(r.data.data()+4),le64(r.data.data()+start_off),le64(r.data.data()+data_off)};
             if(!v.sector_size||(v.sector_size&(v.sector_size-1))||v.sector_size>65536) throw std::runtime_error("invalid sector size");
             m.volumes.push_back(v);
         }
