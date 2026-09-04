@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -7,6 +8,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -79,6 +81,47 @@ static std::vector<uint8_t> decode_legacy(const std::vector<uint8_t>& src,size_t
     return out;
 }
 
+// Raw RFC 1951 DEFLATE used when the IMG2 header's compression flag is 1.
+static std::vector<uint8_t> decode_deflate(const std::vector<uint8_t>& src,size_t out_size) {
+    struct Bits {
+        const std::vector<uint8_t>& s; size_t p=0;
+        uint32_t get(unsigned n) { if(n>24||p+n>s.size()*8) throw std::runtime_error("truncated DEFLATE stream"); uint32_t v=0; for(unsigned i=0;i<n;++i) v|=uint32_t((s[(p+i)>>3]>>((p+i)&7))&1)<<i; p+=n; return v; }
+        void align() { p=(p+7)&~size_t(7); }
+    } bits{src};
+    struct Huff {
+        unsigned maxlen=0; std::vector<std::vector<int>> tab;
+        explicit Huff(const std::vector<uint8_t>& lens) : tab(16) {
+            std::array<unsigned,16> count{},next{};
+            for(uint8_t n:lens) { if(n>15) throw std::runtime_error("invalid DEFLATE Huffman length"); if(n){++count[n]; maxlen=std::max(maxlen,unsigned(n));} }
+            unsigned code=0; for(unsigned n=1;n<=15;++n){code=(code+count[n-1])<<1; next[n]=code; if(code+count[n]>(1U<<n)) throw std::runtime_error("oversubscribed DEFLATE tree");}
+            for(unsigned n=1;n<=maxlen;++n) tab[n].assign(size_t(1)<<n,-1);
+            for(size_t sym=0;sym<lens.size();++sym) if(unsigned n=lens[sym]) { unsigned c=next[n]++,r=0; for(unsigned i=0;i<n;++i) r=(r<<1)|((c>>i)&1); tab[n][r]=int(sym); }
+        }
+        int read(Bits& b) const { unsigned c=0; for(unsigned n=1;n<=maxlen;++n){c|=b.get(1)<<(n-1); if(tab[n][c]>=0)return tab[n][c];} throw std::runtime_error("invalid DEFLATE Huffman code"); }
+    };
+    auto fixed=[](){ std::vector<uint8_t> ll(288),dd(32,5); for(unsigned i=0;i<=143;++i)ll[i]=8; for(unsigned i=144;i<=255;++i)ll[i]=9; for(unsigned i=256;i<=279;++i)ll[i]=7; for(unsigned i=280;i<=287;++i)ll[i]=8; return std::pair<Huff,Huff>{Huff(ll),Huff(dd)}; };
+    std::vector<uint8_t> out; out.reserve(out_size); bool final=false;
+    static const unsigned lbase[29]={3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258};
+    static const uint8_t lextra[29]={0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0};
+    static const unsigned dbase[30]={1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577};
+    static const uint8_t dextra[30]={0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13};
+    while(!final) {
+        final=bits.get(1)!=0; unsigned kind=bits.get(2);
+        if(kind==0) { bits.align(); unsigned len=bits.get(16),inv=bits.get(16); if((len^0xffffU)!=inv)throw std::runtime_error("invalid DEFLATE stored block"); if(len>out_size-out.size())throw std::runtime_error("DEFLATE output overflow"); while(len--)out.push_back(uint8_t(bits.get(8))); continue; }
+        if(kind==3) throw std::runtime_error("reserved DEFLATE block type");
+        Huff lit(std::vector<uint8_t>{}),dist(std::vector<uint8_t>{});
+        if(kind==1) { auto h=fixed(); lit=std::move(h.first); dist=std::move(h.second); }
+        else {
+            unsigned nl=bits.get(5)+257,nd=bits.get(5)+1,nc=bits.get(4)+4; static const uint8_t order[19]={16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
+            std::vector<uint8_t> cl(19); for(unsigned i=0;i<nc;++i)cl[order[i]]=uint8_t(bits.get(3)); Huff ch(cl); std::vector<uint8_t> lens; lens.reserve(nl+nd);
+            while(lens.size()<nl+nd) { int s=ch.read(bits); if(s<=15)lens.push_back(uint8_t(s)); else { unsigned rep; uint8_t value=0; if(s==16){if(lens.empty())throw std::runtime_error("invalid DEFLATE repeat"); value=lens.back(); rep=bits.get(2)+3;} else if(s==17)rep=bits.get(3)+3; else if(s==18)rep=bits.get(7)+11; else throw std::runtime_error("invalid DEFLATE code-length symbol"); if(rep>nl+nd-lens.size())throw std::runtime_error("DEFLATE repeat overflow"); lens.insert(lens.end(),rep,value); } }
+            lit=Huff(std::vector<uint8_t>(lens.begin(),lens.begin()+nl)); dist=Huff(std::vector<uint8_t>(lens.begin()+nl,lens.end()));
+        }
+        for(;;) { int s=lit.read(bits); if(s<256){if(out.size()==out_size)throw std::runtime_error("DEFLATE output overflow");out.push_back(uint8_t(s));continue;} if(s==256)break; if(s<257||s>285)throw std::runtime_error("invalid DEFLATE length"); unsigned li=unsigned(s-257),len=lbase[li]+bits.get(lextra[li]); int ds=dist.read(bits); if(ds<0||ds>=30)throw std::runtime_error("invalid DEFLATE distance"); size_t d=dbase[ds]+bits.get(dextra[ds]); if(!d||d>out.size()||len>out_size-out.size())throw std::runtime_error("invalid DEFLATE back-reference"); while(len--)out.push_back(out[out.size()-d]); }
+    }
+    if(out.size()!=out_size)throw std::runtime_error("DEFLATE size mismatch"); return out;
+}
+
 struct Volume { uint32_t sector_size{}; uint64_t start_lba{}, data_offset{}; };
 struct Metadata { uint32_t flags{},compression{}; bool encrypted{}; uint64_t disk_size{}; std::vector<uint8_t> boot_data; std::vector<Volume> volumes; };
 static Metadata metadata(std::ifstream& in,bool verbose) {
@@ -97,6 +140,7 @@ static Metadata metadata(std::ifstream& in,bool verbose) {
             if(header_size>r.data.size()||stored>r.data.size()-header_size) throw std::runtime_error("invalid type-4 disk metadata");
             std::vector<uint8_t> packed(r.data.begin()+header_size,r.data.begin()+header_size+stored);
             if(stored==expanded) m.boot_data=std::move(packed);
+            else if(m.compression==1) m.boot_data=decode_deflate(packed,expanded);
             else if(m.compression==14||m.compression==15) m.boot_data=decode_lz(packed,expanded);
             else if(m.compression==0) m.boot_data=decode_legacy(packed,expanded);
             else throw std::runtime_error("unsupported type-4 metadata compression");
@@ -161,6 +205,7 @@ static void convert(const fs::path& src,const fs::path& dst,bool verbose) {
         }
         std::vector<uint8_t> expanded;
         if(stored_size==expanded_size) expanded=packed;
+        else if(m.compression==1) expanded=decode_deflate(packed,expanded_size);
         else if(m.compression==14||m.compression==15) expanded=decode_lz(packed,expanded_size);
         else if(m.compression==0) expanded=decode_legacy(packed,expanded_size);
         else throw std::runtime_error("compressed block in uncompressed image");
