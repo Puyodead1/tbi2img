@@ -83,6 +83,11 @@ TBI data-stream offset at `236`. A type-2 control record terminates one volume,
 not the entire backup. Whole-disk extraction must independently process every
 volume descriptor into the shared raw image.
 
+Legacy format `0x27200` with header flags zero uses the bit-oriented codec at
+`0x820E5A0` and four-byte data-block headers (the checksum word is absent).
+Its 276-byte volume descriptors retain the sector-size, start-LBA, and stream
+offset fields used by the current format.
+
 ## IDA evidence map
 
 The unpacked binary is `imagel.unpacked`; the IDA database is `imagel_tbi`.

@@ -62,6 +62,23 @@ static std::vector<uint8_t> decode_lz(const std::vector<uint8_t>& src, size_t ou
     return out;
 }
 
+// Legacy bit-oriented codec at imagel 0x820E5A0/0x820E5E0.
+static std::vector<uint8_t> decode_legacy(const std::vector<uint8_t>& src,size_t out_size) {
+    std::vector<uint8_t> out; out.reserve(out_size); size_t bit=3;
+    auto bits=[&](unsigned n)->uint32_t { if(n>24||bit+n>src.size()*8) throw std::runtime_error("truncated legacy stream"); uint32_t v=0; for(unsigned i=0;i<n;++i) v|=uint32_t((src[(bit+i)/8]>>((bit+i)%8))&1)<<i; bit+=n; return v; };
+    auto unary=[&]()->unsigned { unsigned n=0; while(bits(1)==0) { if(++n>15) throw std::runtime_error("invalid legacy prefix"); } return n; };
+    while(out.size()<out_size) {
+        if(bits(1)==0) { out.push_back(uint8_t(bits(8))); continue; }
+        unsigned k=unary(); size_t length=(size_t(1)<<k)+bits(k)+1;
+        size_t distance;
+        if(length==2) distance=bits(8);
+        else { unsigned d=unary(); distance=((size_t(bits(d))+((size_t(1)<<d)-1))<<8)|bits(8); }
+        if(!distance||distance>out.size()||length>out_size-out.size()) throw std::runtime_error("invalid legacy back-reference");
+        for(size_t i=0;i<length;++i) out.push_back(out[out.size()-distance]);
+    }
+    return out;
+}
+
 struct Volume { uint32_t sector_size{}; uint64_t start_lba{}, data_offset{}; };
 struct Metadata { uint32_t flags{},compression{}; bool encrypted{}; uint64_t disk_size{}; std::vector<uint8_t> boot_data; std::vector<Volume> volumes; };
 static Metadata metadata(std::ifstream& in,bool verbose) {
@@ -81,6 +98,7 @@ static Metadata metadata(std::ifstream& in,bool verbose) {
             std::vector<uint8_t> packed(r.data.begin()+header_size,r.data.begin()+header_size+stored);
             if(stored==expanded) m.boot_data=std::move(packed);
             else if(m.compression==14||m.compression==15) m.boot_data=decode_lz(packed,expanded);
+            else if(m.compression==0) m.boot_data=decode_legacy(packed,expanded);
             else throw std::runtime_error("unsupported type-4 metadata compression");
             uint32_t disk_sector=le32(r.data.data()+8);
             if(disk_sector&&m.boot_data.size()>=disk_sector+40&&std::memcmp(m.boot_data.data()+disk_sector,"EFI PART",8)==0)
@@ -125,7 +143,7 @@ static void convert(const fs::path& src,const fs::path& dst,bool verbose) {
       if(verbose) std::cerr<<"volume "<<vi<<" data_offset="<<data_off<<" start_lba="<<lba<<" sector_size="<<sector<<"\n";
       bool volume_done=false;
       while(!volume_done&&in.peek()!=std::char_traits<char>::eof()) {
-        std::array<uint8_t,8> h{}; read_exact(in,h.data(),h.size(),"block header");
+        std::array<uint8_t,8> h{}; size_t header_size=(m.flags&0x80)?8:4; read_exact(in,h.data(),header_size,"block header");
         uint16_t ef=le16(h.data()),sf=le16(h.data()+2); uint32_t expected=le32(h.data()+4);
         size_t flagged=ef?ef:65536U,expanded_size=flagged&~size_t(1),stored_size=sf?sf:65536U; std::vector<uint8_t> packed(stored_size);
         read_exact(in,packed.data(),packed.size(),"block payload"); ++blocks;
@@ -139,9 +157,10 @@ static void convert(const fs::path& src,const fs::path& dst,bool verbose) {
         std::vector<uint8_t> expanded;
         if(stored_size==expanded_size) expanded=packed;
         else if(m.compression==14||m.compression==15) expanded=decode_lz(packed,expanded_size);
+        else if(m.compression==0) expanded=decode_legacy(packed,expanded_size);
         else throw std::runtime_error("compressed block in uncompressed image");
         uint32_t mix=(uint32_t(sf)<<16)|ef;
-        if(expected!=(tbi_hash(packed.data(),packed.size())^mix)&&expected!=(tbi_hash(expanded.data(),expanded.size())^mix))
+        if(header_size==8&&expected!=(tbi_hash(packed.data(),packed.size())^mix)&&expected!=(tbi_hash(expanded.data(),expanded.size())^mix))
             throw std::runtime_error("block checksum mismatch at block "+std::to_string(blocks));
         if((flagged&0x1ffU)==0) {
             if(expanded.size()%sector) throw std::runtime_error("data block is not sector aligned"); uint64_t count=expanded.size()/sector;
