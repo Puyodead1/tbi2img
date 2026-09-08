@@ -88,6 +88,23 @@ Legacy format `0x27200` with header flags zero uses the bit-oriented codec at
 Its 276-byte volume descriptors retain the sector-size, start-LBA, and stream
 offset fields used by the current format.
 
+## Pre-IMG2 `IMG` format
+
+Image for Linux 1.99 reads an older, partition-oriented format whose signature
+is `IMG\0`. Its 68-byte header occupies the beginning of a 512-byte sector. The
+32-bit value at offset 4 is the partition's logical sector count, the 16-bit
+value at offset 10 is unused padding at the physical end of the file, and the
+32-bit value at offset 52 is the decoded-stream checksum.
+
+Starting at file offset 512, each chunk has two little-endian 16-bit fields
+(`expanded_size`, `stored_size`) followed by `stored_size` bytes. Unequal sizes
+select the same bit-oriented codec described above. The expanded stream uses
+five-byte commands: a zero byte plus a 32-bit sector count creates a sparse
+skip; a nonzero byte plus a sector count introduces that many sectors of raw
+data. A count of `0xffffffff` ends command processing for the current chunk.
+Chunk checksums use the 16-bit recurrence `word + ((hash << 8) XOR hash)` over
+little-endian words; their sum is compared with the header value at offset 52.
+
 ## IDA evidence map
 
 The unpacked binary is `imagel.unpacked`; the IDA database is `imagel_tbi`.
@@ -100,6 +117,12 @@ The unpacked binary is `imagel.unpacked`; the IDA database is `imagel_tbi`.
 | `0x809E390` | `tbi_read_file_header` |
 | `0x809EF50` | `tbi_read_volume_records` |
 | `0x809E170` | `tbi_validate_record_stream` |
+
+For the pre-IMG2 format, the independently supplied IMAGEL 1.99 binary was
+unpacked and analyzed as IDA database `old_unpacked`. The header recognition
+routine is at `0x804A870`, the restore/validate chunk loop is at `0x8053881`,
+the legacy decoder wrapper is at `0x805A1E0`, and its bit decoder is at
+`0x805A250`.
 
 ## Validation
 

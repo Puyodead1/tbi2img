@@ -171,8 +171,109 @@ static void seek_output(std::fstream& out,uint64_t pos) {
     out.seekp(static_cast<std::streamoff>(pos)); if(!out) throw std::runtime_error("output seek failed");
 }
 
+// Original Image for DOS/Linux ("IMG\0") format, as used by IMAGEL 1.99.
+// Its 68-byte header is padded to one sector.  The remainder consists of
+// uint16_t expanded/stored sizes followed by a legacy-compressed chunk.  The
+// expanded byte stream contains five-byte sparse-run commands:
+//   0, sector_count     skip sectors
+//   1, sector_count     the following bytes are allocated sector data
+//   *, 0xffffffff       end of commands in this expanded chunk
+static uint16_t legacy_chunk_hash(const std::vector<uint8_t>& data) {
+    uint16_t h=0;
+    for(size_t off=0;off+1<data.size();off+=2) {
+        const uint16_t word=le16(data.data()+off);
+        h=uint16_t(word+uint16_t((uint16_t(h<<8))^h));
+    }
+    return h;
+}
+
+static void convert_img1(std::ifstream& in,const fs::path& dst,bool verbose) {
+    std::array<uint8_t,512> header{};
+    in.clear(); in.seekg(0); read_exact(in,header.data(),header.size(),"legacy IMG header");
+    if(std::memcmp(header.data(),"IMG\0",4)) throw std::runtime_error("not a legacy IMG image");
+
+    const uint64_t total_sectors=le32(header.data()+4);
+    if(!total_sectors) throw std::runtime_error("legacy IMG has an invalid sector count");
+    const uint64_t logical_size=total_sectors*512U;
+    const uint32_t expected_hash=le32(header.data()+52);
+    const uint16_t tail_padding=le16(header.data()+10);
+    in.seekg(0,std::ios::end);
+    const auto end_pos=in.tellg();
+    if(end_pos<0) throw std::runtime_error("cannot determine legacy input size");
+    const uint64_t input_size=static_cast<uint64_t>(end_pos);
+    if(input_size<512U+tail_padding) throw std::runtime_error("invalid legacy IMG padding");
+    const uint64_t stream_end=input_size-tail_padding;
+    in.seekg(512);
+
+    std::fstream out(dst,std::ios::binary|std::ios::in|std::ios::out|std::ios::trunc);
+    if(!out) throw std::runtime_error("cannot create output");
+
+    uint64_t sector=0,pending_bytes=0,written=0,blocks=0;
+    uint32_t stream_hash=0;
+    bool terminated=false;
+    while(!terminated) {
+        const auto input_pos=in.tellg();
+        if(input_pos<0) throw std::runtime_error("cannot determine legacy input position");
+        const uint64_t pos64=static_cast<uint64_t>(input_pos);
+        if(pos64==stream_end) { terminated=true; break; }
+        if(pos64>stream_end||stream_end-pos64<4) throw std::runtime_error("truncated legacy block header");
+        std::array<uint8_t,4> bh{};
+        read_exact(in,bh.data(),bh.size(),"legacy block header");
+        const size_t expanded_size=le16(bh.data());
+        const size_t stored_size=le16(bh.data()+2);
+        if(!expanded_size||!stored_size) throw std::runtime_error("invalid legacy block size");
+        if(stored_size>stream_end-pos64-4) throw std::runtime_error("truncated legacy block payload");
+        std::vector<uint8_t> packed(stored_size);
+        read_exact(in,packed.data(),packed.size(),"legacy block payload");
+        std::vector<uint8_t> expanded=stored_size==expanded_size
+            ? std::move(packed) : decode_legacy(packed,expanded_size);
+        stream_hash+=legacy_chunk_hash(expanded);
+        ++blocks;
+
+        size_t pos=0;
+        while(pos<expanded.size()) {
+            if(pending_bytes) {
+                const size_t take=static_cast<size_t>(std::min<uint64_t>(pending_bytes,expanded.size()-pos));
+                if(take%512) throw std::runtime_error("legacy data run is not sector aligned");
+                if(sector>total_sectors||take/512>total_sectors-sector)
+                    throw std::runtime_error("legacy data run exceeds partition size");
+                seek_output(out,sector*512U);
+                out.write(reinterpret_cast<const char*>(expanded.data()+pos),static_cast<std::streamsize>(take));
+                if(!out) throw std::runtime_error("output write failed");
+                pos+=take; pending_bytes-=take; sector+=take/512; written+=take;
+                continue;
+            }
+            if(expanded.size()-pos<5) throw std::runtime_error("truncated legacy run command");
+            const uint8_t kind=expanded[pos];
+            const uint32_t count=le32(expanded.data()+pos+1);
+            pos+=5;
+            if(count==0xffffffffU) break;
+            if(!kind) {
+                if(count>total_sectors-sector) throw std::runtime_error("legacy sparse run exceeds partition size");
+                sector+=count;
+                if(sector==total_sectors) { terminated=true; break; }
+            } else {
+                if(count>total_sectors-sector) throw std::runtime_error("legacy allocated run exceeds partition size");
+                pending_bytes=uint64_t(count)*512U;
+            }
+        }
+        if(verbose&&!(blocks%1024)) std::cerr<<"legacy blocks="<<blocks<<" wrote="<<(written>>20)<<" MiB\r";
+    }
+    if(pending_bytes) throw std::runtime_error("legacy image ended with an incomplete data run");
+    if(expected_hash&&stream_hash!=expected_hash) throw std::runtime_error("legacy stream checksum mismatch");
+    if(sector>total_sectors) throw std::runtime_error("legacy image exceeds declared partition size");
+    seek_output(out,logical_size-1); const char zero=0; out.write(&zero,1); out.flush();
+    if(!out) throw std::runtime_error("cannot finalize output");
+    std::cerr<<"Converted legacy IMG: "<<blocks<<" blocks; wrote "<<(written>>20)
+             <<" MiB; logical size "<<(logical_size>>20)<<" MiB\n";
+}
+
 static void convert(const fs::path& src,const fs::path& dst,bool verbose) {
-    std::ifstream in(src,std::ios::binary); if(!in) throw std::runtime_error("cannot open input"); Metadata m=metadata(in,verbose);
+    std::ifstream in(src,std::ios::binary); if(!in) throw std::runtime_error("cannot open input");
+    std::array<uint8_t,4> magic{}; read_exact(in,magic.data(),magic.size(),"image signature");
+    in.clear(); in.seekg(0);
+    if(!std::memcmp(magic.data(),"IMG\0",4)) { convert_img1(in,dst,verbose); return; }
+    Metadata m=metadata(in,verbose);
     if(m.encrypted) throw std::runtime_error("encrypted images are not supported");
     if(m.compression!=0&&m.compression!=1&&m.compression!=14&&m.compression!=15) throw std::runtime_error("unsupported compression option "+std::to_string(m.compression));
     std::fstream out(dst,std::ios::binary|std::ios::in|std::ios::out|std::ios::trunc); if(!out) throw std::runtime_error("cannot create output");
@@ -247,6 +348,23 @@ static void convert(const fs::path& src,const fs::path& dst,bool verbose) {
     std::cerr<<"Converted "<<blocks<<" blocks; wrote "<<(written>>20)<<" MiB; logical size "<<(max_end>>20)<<" MiB\n";
 }
 int main(int argc,char** argv) {
-    try { if(argc<3||argc>4){std::cerr<<"Usage: tbi2img <input.tbi> <output.img> [--verbose]\n";return 2;} convert(argv[1],argv[2],argc==4&&std::string(argv[3])=="--verbose"); return 0; }
+    try {
+        bool verbose=false;
+        std::vector<std::string> positional;
+        for(int i=1;i<argc;++i) {
+            const std::string arg=argv[i];
+            if(arg=="--verbose") verbose=true;
+            else if(!arg.empty()&&arg[0]=='-') {
+                std::cerr<<"tbi2img: unknown option "<<arg<<"\n";
+                return 2;
+            } else positional.push_back(arg);
+        }
+        if(positional.size()!=2) {
+            std::cerr<<"Usage: tbi2img [--verbose] <input.tbi> <output.img>\n";
+            return 2;
+        }
+        convert(positional[0],positional[1],verbose);
+        return 0;
+    }
     catch(const std::exception& e){std::cerr<<"tbi2img: "<<e.what()<<"\n";return 1;}
 }
