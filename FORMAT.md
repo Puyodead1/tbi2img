@@ -83,6 +83,14 @@ TBI data-stream offset at `236`. A type-2 control record terminates one volume,
 not the entire backup. Whole-disk extraction must independently process every
 volume descriptor into the shared raw image.
 
+File-based split IMG2 sets use the primary name `name.TBI`, followed by
+`name.1`, `name.2`, and so on. Continuations contain raw stream bytes without a
+second metadata header, and any block header or payload may cross a physical
+file boundary. Data-stream offsets in volume descriptors address the virtual
+concatenation of the complete set. Stream control type 1 is bookkeeping rather
+than an end-of-volume marker; the reader ignores it while `ReadSpan` advances
+to the next numbered file.
+
 Legacy format `0x27200` with header flags zero uses the bit-oriented codec at
 `0x820E5A0` and four-byte data-block headers (the checksum word is absent).
 Its 276-byte volume descriptors retain the sector-size, start-LBA, and stream
@@ -105,6 +113,13 @@ data. A count of `0xffffffff` ends command processing for the current chunk.
 Chunk checksums use the 16-bit recurrence `word + ((hash << 8) XOR hash)` over
 little-endian words; their sum is compared with the header value at offset 52.
 
+Split images keep the header only in the `.img` file. The compressed byte
+stream continues directly into `.001`, `.002`, and so on, and a compressed
+chunk may cross a file boundary. IMAGEL generates the numeric extension with
+`%03i`. The converter resolves companion filenames case-insensitively to
+support sets such as `part0.img` plus `PART0.001`, and uses the physical sector
+count at header offset 14 to determine when the complete set has been read.
+
 ## IDA evidence map
 
 The unpacked binary is `imagel.unpacked`; the IDA database is `imagel_tbi`.
@@ -118,11 +133,16 @@ The unpacked binary is `imagel.unpacked`; the IDA database is `imagel_tbi`.
 | `0x809EF50` | `tbi_read_volume_records` |
 | `0x809E170` | `tbi_validate_record_stream` |
 
+The Image for Linux 2.x database `v2_split` further identifies
+`CImgFileSup::ReadSpan` at `0x8054667`, `BuildNewFileName` at `0x8054BFC`, and
+`OpenImageFile` at `0x8054D41` as the IMG2 file-set implementation.
+
 For the pre-IMG2 format, the independently supplied IMAGEL 1.99 binary was
 unpacked and analyzed as IDA database `old_unpacked`. The header recognition
 routine is at `0x804A870`, the restore/validate chunk loop is at `0x8053881`,
 the legacy decoder wrapper is at `0x805A1E0`, and its bit decoder is at
-`0x805A250`.
+`0x805A250`. The short-read handler at `0x8054FE7` opens the next physical file
+through the `%03i` segment-name routine at `0x8055CFC`.
 
 ## Validation
 

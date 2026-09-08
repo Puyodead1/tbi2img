@@ -1,6 +1,8 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cctype>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -119,7 +121,8 @@ static std::vector<uint8_t> decode_deflate(const std::vector<uint8_t>& src,size_
         }
         for(;;) { int s=lit.read(bits); if(s<256){if(out.size()==out_size)throw std::runtime_error("DEFLATE output overflow");out.push_back(uint8_t(s));continue;} if(s==256)break; if(s<257||s>285)throw std::runtime_error("invalid DEFLATE length"); unsigned li=unsigned(s-257),len=lbase[li]+bits.get(lextra[li]); int ds=dist.read(bits); if(ds<0||ds>=30)throw std::runtime_error("invalid DEFLATE distance"); size_t d=dbase[ds]+bits.get(dextra[ds]); if(!d||d>out.size()||len>out_size-out.size())throw std::runtime_error("invalid DEFLATE back-reference"); while(len--)out.push_back(out[out.size()-d]); }
     }
-    if(out.size()!=out_size)throw std::runtime_error("DEFLATE size mismatch"); return out;
+    if(out.size()!=out_size) throw std::runtime_error("DEFLATE size mismatch");
+    return out;
 }
 
 struct Volume { uint32_t sector_size{}; uint64_t start_lba{}, data_offset{}; };
@@ -159,16 +162,28 @@ static Metadata metadata(std::ifstream& in,bool verbose) {
             m.volumes.push_back(v);
         }
     }
-    if(first||m.volumes.empty()) throw std::runtime_error("missing TBI header or volume descriptors"); return m;
+    if(first||m.volumes.empty()) throw std::runtime_error("missing TBI header or volume descriptors");
+    return m;
 }
 static bool control_record(const std::vector<uint8_t>& d,Record& r) {
-    if(d.size()<12) return false; r={le32(d.data()),le32(d.data()+4),le32(d.data()+8),{}};
-    if(r.type>3||r.size!=d.size()-12) return false; r.data.assign(d.begin()+12,d.end());
+    if(d.size()<12) return false;
+    r={le32(d.data()),le32(d.data()+4),le32(d.data()+8),{}};
+    if(r.type>3||r.size!=d.size()-12) return false;
+    r.data.assign(d.begin()+12,d.end());
     return r.check==((r.type+r.size)^tbi_hash(r.data.data(),r.data.size()));
 }
 static void seek_output(std::fstream& out,uint64_t pos) {
     if(pos>uint64_t(std::numeric_limits<std::streamoff>::max())) throw std::runtime_error("output offset too large");
     out.seekp(static_cast<std::streamoff>(pos)); if(!out) throw std::runtime_error("output seek failed");
+}
+static void ensure_output_size(std::fstream& out,uint64_t size) {
+    if(!size) return;
+    out.clear(); out.seekp(0,std::ios::end);
+    const auto current=out.tellp();
+    if(current<0) throw std::runtime_error("cannot determine output size");
+    if(static_cast<uint64_t>(current)<size) {
+        seek_output(out,size-1); const char zero=0; out.write(&zero,1);
+    }
 }
 
 // Original Image for DOS/Linux ("IMG\0") format, as used by IMAGEL 1.99.
@@ -187,7 +202,107 @@ static uint16_t legacy_chunk_hash(const std::vector<uint8_t>& data) {
     return h;
 }
 
-static void convert_img1(std::ifstream& in,const fs::path& dst,bool verbose) {
+static std::string ascii_lower(std::string value) {
+    for(char& c:value) c=static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return value;
+}
+
+static fs::path find_legacy_segment(const fs::path& first,unsigned number) {
+    char extension[5]{};
+    std::snprintf(extension,sizeof(extension),".%03u",number);
+    const fs::path wanted=first.parent_path()/(first.stem().string()+extension);
+    if(fs::exists(wanted)) return wanted;
+
+    // ISO contents are often copied between case-sensitive and
+    // case-insensitive file systems (part0.img plus PART0.001).
+    const std::string wanted_name=ascii_lower(wanted.filename().string());
+    const fs::path directory=first.parent_path().empty()?fs::path("."):first.parent_path();
+    for(const auto& entry:fs::directory_iterator(directory))
+        if(entry.is_regular_file()&&ascii_lower(entry.path().filename().string())==wanted_name)
+            return entry.path();
+    return {};
+}
+
+static fs::path find_tbi_segment(const fs::path& first,unsigned number) {
+    const fs::path wanted=first.parent_path()/(first.stem().string()+"."+std::to_string(number));
+    if(fs::exists(wanted)) return wanted;
+    const std::string wanted_name=ascii_lower(wanted.filename().string());
+    const fs::path directory=first.parent_path().empty()?fs::path("."):first.parent_path();
+    for(const auto& entry:fs::directory_iterator(directory))
+        if(entry.is_regular_file()&&ascii_lower(entry.path().filename().string())==wanted_name)
+            return entry.path();
+    return {};
+}
+
+class TbiSegmentedInput {
+public:
+    TbiSegmentedInput(const fs::path& first,bool verbose):verbose_(verbose) {
+        paths_.push_back(first); sizes_.push_back(fs::file_size(first));
+        for(unsigned number=1;;++number) {
+            fs::path next=find_tbi_segment(first,number);
+            if(next.empty()) break;
+            paths_.push_back(next); sizes_.push_back(fs::file_size(next));
+        }
+        open_segment(0,0);
+    }
+
+    uint64_t tell() const { return position_; }
+    bool eof() const { return position_==total_size(); }
+
+    void seek(uint64_t position) {
+        uint64_t base=0;
+        for(size_t index=0;index<paths_.size();++index) {
+            if(position<base+sizes_[index]||(position==base+sizes_[index]&&index+1==paths_.size())) {
+                open_segment(index,position-base); position_=position; return;
+            }
+            base+=sizes_[index];
+        }
+        throw std::runtime_error("TBI data offset exceeds the available split image files");
+    }
+
+    void read_exact(void* destination,size_t size,const char* what) {
+        auto* bytes=static_cast<char*>(destination);
+        size_t done=0;
+        while(done<size) {
+            const uint64_t local=local_position();
+            if(local==sizes_[index_]) {
+                if(index_+1>=paths_.size()) throw std::runtime_error(std::string("truncated ")+what);
+                open_segment(index_+1,0);
+                if(verbose_) std::cerr<<"continuing with "<<paths_[index_].filename().string()<<"\n";
+                continue;
+            }
+            const size_t take=static_cast<size_t>(std::min<uint64_t>(size-done,sizes_[index_]-local));
+            file_.read(bytes+done,static_cast<std::streamsize>(take));
+            if(static_cast<size_t>(file_.gcount())!=take) throw std::runtime_error(std::string("truncated ")+what);
+            done+=take; position_+=take;
+        }
+    }
+
+private:
+    uint64_t total_size() const {
+        uint64_t total=0; for(uint64_t size:sizes_) total+=size; return total;
+    }
+    uint64_t segment_base(size_t index) const {
+        uint64_t base=0; for(size_t i=0;i<index;++i) base+=sizes_[i]; return base;
+    }
+    uint64_t local_position() const { return position_-segment_base(index_); }
+    void open_segment(size_t index,uint64_t local) {
+        file_.close(); file_.clear(); file_.open(paths_[index],std::ios::binary);
+        if(!file_) throw std::runtime_error("cannot open split image segment "+paths_[index].string());
+        file_.seekg(static_cast<std::streamoff>(local));
+        if(!file_) throw std::runtime_error("cannot seek split image segment "+paths_[index].string());
+        index_=index;
+    }
+
+    std::vector<fs::path> paths_;
+    std::vector<uint64_t> sizes_;
+    std::ifstream file_;
+    size_t index_=0;
+    uint64_t position_=0;
+    bool verbose_=false;
+};
+
+static void convert_img1(std::ifstream& in,const fs::path& src,const fs::path& dst,bool verbose) {
     std::array<uint8_t,512> header{};
     in.clear(); in.seekg(0); read_exact(in,header.data(),header.size(),"legacy IMG header");
     if(std::memcmp(header.data(),"IMG\0",4)) throw std::runtime_error("not a legacy IMG image");
@@ -197,13 +312,50 @@ static void convert_img1(std::ifstream& in,const fs::path& dst,bool verbose) {
     const uint64_t logical_size=total_sectors*512U;
     const uint32_t expected_hash=le32(header.data()+52);
     const uint16_t tail_padding=le16(header.data()+10);
-    in.seekg(0,std::ios::end);
-    const auto end_pos=in.tellg();
-    if(end_pos<0) throw std::runtime_error("cannot determine legacy input size");
-    const uint64_t input_size=static_cast<uint64_t>(end_pos);
+    const uint64_t physical_sectors=le32(header.data()+14);
+    if(!physical_sectors||physical_sectors>(std::numeric_limits<uint64_t>::max()-512U)/512U)
+        throw std::runtime_error("legacy IMG has an invalid physical size");
+    const uint64_t input_size=512U+physical_sectors*512U;
     if(input_size<512U+tail_padding) throw std::runtime_error("invalid legacy IMG padding");
-    const uint64_t stream_end=input_size-tail_padding;
-    in.seekg(512);
+    const uint64_t stream_size=input_size-512U-tail_padding;
+
+    std::vector<fs::path> segments{src};
+    uint64_t available=fs::file_size(src);
+    for(unsigned number=1;available<input_size;++number) {
+        if(number>999) throw std::runtime_error("legacy IMG has too many split segments");
+        fs::path next=find_legacy_segment(src,number);
+        if(next.empty()) {
+            char extension[5]{}; std::snprintf(extension,sizeof(extension),".%03u",number);
+            throw std::runtime_error("missing split image segment "+(src.stem().string()+extension));
+        }
+        const uint64_t segment_size=fs::file_size(next);
+        if(segment_size>input_size-available)
+            throw std::runtime_error("split image segments exceed the size declared by the IMG header");
+        segments.push_back(std::move(next)); available+=segment_size;
+    }
+    if(available!=input_size) throw std::runtime_error("legacy IMG physical size mismatch");
+
+    in.close();
+    size_t segment_index=0;
+    std::ifstream segment_in(segments.front(),std::ios::binary);
+    segment_in.seekg(512);
+    uint64_t consumed=0;
+    auto read_segmented=[&](void* destination,size_t size,const char* what) {
+        auto* out_bytes=static_cast<char*>(destination);
+        size_t done=0;
+        while(done<size) {
+            segment_in.read(out_bytes+done,static_cast<std::streamsize>(size-done));
+            const size_t got=static_cast<size_t>(segment_in.gcount());
+            done+=got; consumed+=got;
+            if(done==size) break;
+            if(!segment_in.eof()||++segment_index>=segments.size())
+                throw std::runtime_error(std::string("truncated ")+what);
+            segment_in.close(); segment_in.clear();
+            segment_in.open(segments[segment_index],std::ios::binary);
+            if(!segment_in) throw std::runtime_error("cannot open split image segment "+segments[segment_index].string());
+            if(verbose) std::cerr<<"continuing with "<<segments[segment_index].filename().string()<<"\n";
+        }
+    };
 
     std::fstream out(dst,std::ios::binary|std::ios::in|std::ios::out|std::ios::trunc);
     if(!out) throw std::runtime_error("cannot create output");
@@ -212,19 +364,16 @@ static void convert_img1(std::ifstream& in,const fs::path& dst,bool verbose) {
     uint32_t stream_hash=0;
     bool terminated=false;
     while(!terminated) {
-        const auto input_pos=in.tellg();
-        if(input_pos<0) throw std::runtime_error("cannot determine legacy input position");
-        const uint64_t pos64=static_cast<uint64_t>(input_pos);
-        if(pos64==stream_end) { terminated=true; break; }
-        if(pos64>stream_end||stream_end-pos64<4) throw std::runtime_error("truncated legacy block header");
+        if(consumed==stream_size) { terminated=true; break; }
+        if(consumed>stream_size||stream_size-consumed<4) throw std::runtime_error("truncated legacy block header");
         std::array<uint8_t,4> bh{};
-        read_exact(in,bh.data(),bh.size(),"legacy block header");
+        read_segmented(bh.data(),bh.size(),"legacy block header");
         const size_t expanded_size=le16(bh.data());
         const size_t stored_size=le16(bh.data()+2);
         if(!expanded_size||!stored_size) throw std::runtime_error("invalid legacy block size");
-        if(stored_size>stream_end-pos64-4) throw std::runtime_error("truncated legacy block payload");
+        if(stored_size>stream_size-consumed) throw std::runtime_error("truncated legacy block payload");
         std::vector<uint8_t> packed(stored_size);
-        read_exact(in,packed.data(),packed.size(),"legacy block payload");
+        read_segmented(packed.data(),packed.size(),"legacy block payload");
         std::vector<uint8_t> expanded=stored_size==expanded_size
             ? std::move(packed) : decode_legacy(packed,expanded_size);
         stream_hash+=legacy_chunk_hash(expanded);
@@ -262,7 +411,7 @@ static void convert_img1(std::ifstream& in,const fs::path& dst,bool verbose) {
     if(pending_bytes) throw std::runtime_error("legacy image ended with an incomplete data run");
     if(expected_hash&&stream_hash!=expected_hash) throw std::runtime_error("legacy stream checksum mismatch");
     if(sector>total_sectors) throw std::runtime_error("legacy image exceeds declared partition size");
-    seek_output(out,logical_size-1); const char zero=0; out.write(&zero,1); out.flush();
+    ensure_output_size(out,logical_size); out.flush();
     if(!out) throw std::runtime_error("cannot finalize output");
     std::cerr<<"Converted legacy IMG: "<<blocks<<" blocks; wrote "<<(written>>20)
              <<" MiB; logical size "<<(logical_size>>20)<<" MiB\n";
@@ -272,8 +421,9 @@ static void convert(const fs::path& src,const fs::path& dst,bool verbose) {
     std::ifstream in(src,std::ios::binary); if(!in) throw std::runtime_error("cannot open input");
     std::array<uint8_t,4> magic{}; read_exact(in,magic.data(),magic.size(),"image signature");
     in.clear(); in.seekg(0);
-    if(!std::memcmp(magic.data(),"IMG\0",4)) { convert_img1(in,dst,verbose); return; }
+    if(!std::memcmp(magic.data(),"IMG\0",4)) { convert_img1(in,src,dst,verbose); return; }
     Metadata m=metadata(in,verbose);
+    TbiSegmentedInput image_files(src,verbose);
     if(m.encrypted) throw std::runtime_error("encrypted images are not supported");
     if(m.compression!=0&&m.compression!=1&&m.compression!=14&&m.compression!=15) throw std::runtime_error("unsupported compression option "+std::to_string(m.compression));
     std::fstream out(dst,std::ios::binary|std::ios::in|std::ios::out|std::ios::trunc); if(!out) throw std::runtime_error("cannot create output");
@@ -288,20 +438,20 @@ static void convert(const fs::path& src,const fs::path& dst,bool verbose) {
       const Volume& volume=m.volumes[vi];
       uint32_t sector=volume.sector_size; uint64_t lba=volume.start_lba,pending=0;
       uint64_t data_off=volume.data_offset;
-      in.clear(); in.seekg(static_cast<std::streamoff>(data_off));
-      if(!in) throw std::runtime_error("invalid data offset for volume "+std::to_string(vi));
+      try { image_files.seek(data_off); }
+      catch(const std::exception&) { throw std::runtime_error("invalid data offset for volume "+std::to_string(vi)); }
       if(verbose) std::cerr<<"volume "<<vi<<" data_offset="<<data_off<<" start_lba="<<lba<<" sector_size="<<sector<<"\n";
       bool volume_done=false;
-      while(!volume_done&&in.peek()!=std::char_traits<char>::eof()) {
-        std::array<uint8_t,8> h{}; size_t header_size=(m.flags&0x80)?8:4; read_exact(in,h.data(),header_size,"block header");
+      while(!volume_done&&!image_files.eof()) {
+        std::array<uint8_t,8> h{}; size_t header_size=(m.flags&0x80)?8:4; image_files.read_exact(h.data(),header_size,"block header");
         uint16_t ef=le16(h.data()),sf=le16(h.data()+2); uint32_t expected=le32(h.data()+4);
         size_t flagged=ef?ef:65536U,expanded_size=flagged&~size_t(1),stored_size=sf?sf:65536U; std::vector<uint8_t> packed(stored_size);
-        read_exact(in,packed.data(),packed.size(),"block payload"); ++blocks;
+        image_files.read_exact(packed.data(),packed.size(),"block payload"); ++blocks;
         Record ctl; if(expanded_size==stored_size&&control_record(packed,ctl)) {
             if(ctl.type==2) { volume_done=true; continue; }
             if(ctl.type==3&&ctl.data.size()>=4) lba+=le32(ctl.data.data());
-            // Type 1 changes physical image-file segments, not logical volumes.
-            if(ctl.type==1) throw std::runtime_error("split TBI segment encountered");
+            // Type 0/1 controls carry stream bookkeeping. Physical file
+            // transitions are handled transparently by TbiSegmentedInput.
             continue;
         }
         std::vector<uint8_t> expanded;
@@ -314,12 +464,15 @@ static void convert(const fs::path& src,const fs::path& dst,bool verbose) {
         if(header_size==8&&expected!=(tbi_hash(packed.data(),packed.size())^mix)&&expected!=(tbi_hash(expanded.data(),expanded.size())^mix))
             throw std::runtime_error("block checksum mismatch at block "+std::to_string(blocks));
         if((flagged&0x1ffU)==0) {
-            if(expanded.size()%sector) throw std::runtime_error("data block is not sector aligned"); uint64_t count=expanded.size()/sector;
-            if(pending&&count>pending) throw std::runtime_error("data block exceeds allocated run"); seek_output(out,lba*uint64_t(sector));
+            if(expanded.size()%sector) throw std::runtime_error("data block is not sector aligned");
+            uint64_t count=expanded.size()/sector;
+            if(pending&&count>pending) throw std::runtime_error("data block exceeds allocated run");
+            seek_output(out,lba*uint64_t(sector));
             out.write(reinterpret_cast<const char*>(expanded.data()),static_cast<std::streamsize>(expanded.size())); if(!out) throw std::runtime_error("output write failed");
             lba+=count; if(pending) pending-=count; written+=expanded.size(); max_end=std::max(max_end,lba*uint64_t(sector));
         } else {
-            if(expanded.size()<4) throw std::runtime_error("short run map"); size_t n=expanded.size()-4;
+            if(expanded.size()<4) throw std::runtime_error("short run map");
+            size_t n=expanded.size()-4;
             if(n%4||le32(expanded.data()+n)!=tbi_hash(expanded.data(),n)) throw std::runtime_error("run-map checksum mismatch");
             for(size_t off=0;off<n;off+=4) { uint32_t w=le32(expanded.data()+off),kind=w&0xf0000000U,count=w&0x0fffffffU; if(!w) break;
                 if(!kind) { if(pending) throw std::runtime_error("overlapping allocated runs"); pending=count; }
@@ -344,7 +497,7 @@ static void convert(const fs::path& src,const fs::path& dst,bool verbose) {
         seek_output(out,backup_lba*512); out.write(reinterpret_cast<const char*>(bh.data()),bh.size());
       }
     }
-    if(max_end) { seek_output(out,max_end-1); char z=0; out.write(&z,1); } out.flush();
+    ensure_output_size(out,max_end); out.flush();
     std::cerr<<"Converted "<<blocks<<" blocks; wrote "<<(written>>20)<<" MiB; logical size "<<(max_end>>20)<<" MiB\n";
 }
 int main(int argc,char** argv) {
