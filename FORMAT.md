@@ -73,10 +73,11 @@ struct TbiBlockHeader {
 
 Compression options 14 and 15 use the custom LZ decoder recovered at
 `0x81A3230`. Map blocks contain 32-bit run words: the high nibble is the run
-kind and the low 28 bits are the sector count. Nonzero run kinds advance across
-holes. A zero-kind entry terminates the map and its low 28 bits give the number
-of allocated sectors supplied by the following data blocks. The map ends with
-the custom 32-bit hash. The restore loop treats
+kind and the low 28 bits are the sector count. Kind `0x8` denotes an allocated
+extent and other nonzero kinds advance across holes. A zero-kind entry both
+terminates the map and describes a final allocated extent. The data blocks that
+follow fill those allocated extents in map order. The map ends with the custom
+32-bit hash. The restore loop treats
 blocks as maps when no allocated run is pending and as sector data while one is
 pending; the low size bit is a useful marker but not the state machine.
 Encrypted images remain unsupported.

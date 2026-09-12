@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -440,7 +441,9 @@ static void convert(const fs::path& src,const fs::path& dst,bool verbose) {
     }
     for(size_t vi=0;vi<m.volumes.size();++vi) {
       const Volume& volume=m.volumes[vi];
-      uint32_t sector=volume.sector_size; uint64_t lba=volume.start_lba,pending=0;
+      struct DataRun { uint64_t lba, sectors; };
+      uint32_t sector=volume.sector_size; uint64_t lba=volume.start_lba,map_end=lba;
+      std::deque<DataRun> runs;
       uint64_t data_off=volume.data_offset;
       try { image_files.seek(data_off); }
       catch(const std::exception&) { throw std::runtime_error("invalid data offset for volume "+std::to_string(vi)); }
@@ -470,13 +473,23 @@ static void convert(const fs::path& src,const fs::path& dst,bool verbose) {
         // The original restore loop distinguishes a map from sector data by
         // whether an allocated run is outstanding.  Bit 0 of the expanded
         // size is normally set on maps, but it is not the state machine.
-        if(pending) {
+        if(!runs.empty()) {
             if(expanded.size()%sector) throw std::runtime_error("data block is not sector aligned");
-            uint64_t count=expanded.size()/sector;
-            if(pending&&count>pending) throw std::runtime_error("data block exceeds allocated run");
-            seek_output(out,lba*uint64_t(sector));
-            out.write(reinterpret_cast<const char*>(expanded.data()),static_cast<std::streamsize>(expanded.size())); if(!out) throw std::runtime_error("output write failed");
-            lba+=count; if(pending) pending-=count; written+=expanded.size(); max_end=std::max(max_end,lba*uint64_t(sector));
+            size_t pos=0;
+            while(pos<expanded.size()) {
+                if(runs.empty()) throw std::runtime_error("data block exceeds allocated runs");
+                DataRun& run=runs.front();
+                const uint64_t available=run.sectors*uint64_t(sector);
+                const size_t take=static_cast<size_t>(std::min<uint64_t>(expanded.size()-pos,available));
+                seek_output(out,run.lba*uint64_t(sector));
+                out.write(reinterpret_cast<const char*>(expanded.data()+pos),static_cast<std::streamsize>(take));
+                if(!out) throw std::runtime_error("output write failed");
+                const uint64_t used=take/sector;
+                run.lba+=used; run.sectors-=used; pos+=take; written+=take;
+                max_end=std::max(max_end,run.lba*uint64_t(sector));
+                if(!run.sectors) runs.pop_front();
+            }
+            if(runs.empty()) lba=map_end;
         } else {
             if(expanded.size()<4) throw std::runtime_error("short run map");
             size_t n=expanded.size()-4;
@@ -484,21 +497,25 @@ static void convert(const fs::path& src,const fs::path& dst,bool verbose) {
             if(n%4||wanted!=got) throw std::runtime_error("run-map checksum mismatch at block "+std::to_string(blocks)+
                 " (stored="+std::to_string(stored_size)+", expanded="+std::to_string(expanded_size)+
                 ", expected="+std::to_string(wanted)+", calculated="+std::to_string(got)+")");
-            bool terminated=false;
+            bool terminated=false; uint64_t cursor=lba;
             for(size_t off=0;off<n;off+=4) {
                 uint32_t w=le32(expanded.data()+off),kind=w&0xf0000000U,count=w&0x0fffffffU;
-                // Image for Linux 2.x DecompressLoop: nonzero kinds advance
-                // across holes.  The terminal zero-kind entry supplies the
-                // allocated-sector count consumed by the following blocks.
-                if(!kind) { pending=count; terminated=true; break; }
-                lba+=count; max_end=std::max(max_end,lba*uint64_t(sector));
+                // Normal restores treat kind 8 and the terminal kind 0 as
+                // allocated extents. Other nonzero kinds are sparse holes.
+                if(kind==0x80000000U||!kind) {
+                    if(count) runs.push_back({cursor,count});
+                    cursor+=count;
+                    if(!kind) { terminated=true; break; }
+                } else cursor+=count;
             }
             if(!terminated) throw std::runtime_error("run map has no terminal allocated run");
+            map_end=cursor; max_end=std::max(max_end,map_end*uint64_t(sector));
+            if(runs.empty()) lba=map_end;
         }
         if(verbose&&!(blocks%4096)) std::cerr<<"blocks="<<blocks<<" written="<<(written>>20)<<" MiB\r";
       }
       if(!volume_done) throw std::runtime_error("volume stream ended without a type-2 terminator");
-      if(pending) throw std::runtime_error("volume ended with an incomplete allocated run");
+      if(!runs.empty()) throw std::runtime_error("volume ended with an incomplete allocated run");
     }
     max_end=std::max(max_end,m.disk_size);
     // Type 4 stores the primary GPT area. Recreate the conventional backup
