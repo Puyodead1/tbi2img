@@ -485,17 +485,13 @@ static void convert(const fs::path& src,const fs::path& dst,bool verbose) {
             bool terminated=false;
             for(size_t off=0;off<n;off+=4) {
                 uint32_t w=le32(expanded.data()+off),kind=w&0xf0000000U,count=w&0x0fffffffU;
-                // Image for Linux 2.x DecompressLoop: a zero high nibble ends
-                // the map; 0x8 is allocated data; all other kinds are holes.
-                if(!kind) { terminated=true; break; }
-                if(kind==0x80000000U) {
-                    if(!count) throw std::runtime_error("empty allocated run");
-                    pending=count;
-                    break;
-                }
+                // Image for Linux 2.x DecompressLoop: nonzero kinds advance
+                // across holes.  The terminal zero-kind entry supplies the
+                // allocated-sector count consumed by the following blocks.
+                if(!kind) { pending=count; terminated=true; break; }
                 lba+=count; max_end=std::max(max_end,lba*uint64_t(sector));
             }
-            if(!pending&&!terminated) throw std::runtime_error("run map has no allocated run or terminator");
+            if(!terminated) throw std::runtime_error("run map has no terminal allocated run");
         }
         if(verbose&&!(blocks%4096)) std::cerr<<"blocks="<<blocks<<" written="<<(written>>20)<<" MiB\r";
       }
