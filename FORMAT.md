@@ -73,9 +73,12 @@ struct TbiBlockHeader {
 
 Compression options 14 and 15 use the custom LZ decoder recovered at
 `0x81A3230`. Map blocks contain 32-bit run words: the high nibble is the run
-kind and the low 28 bits are the sector count. A zero word terminates a map,
-which ends with the custom 32-bit hash. Sector data blocks are sector-aligned
-and are placed according to those maps. Encrypted images remain unsupported.
+kind and the low 28 bits are the sector count. Kind `0x8` denotes allocated
+sectors, a zero high nibble terminates the map, and the other observed kinds
+denote holes. The map ends with the custom 32-bit hash. The restore loop treats
+blocks as maps when no allocated run is pending and as sector data while one is
+pending; the low size bit is a useful marker but not the state machine.
+Encrypted images remain unsupported.
 
 Each current 408-byte volume descriptor stores the logical starting LBA at
 payload offset `108`, the sector size at offset `4`, and that volume's absolute
@@ -136,6 +139,8 @@ The unpacked binary is `imagel.unpacked`; the IDA database is `imagel_tbi`.
 The Image for Linux 2.x database `v2_split` further identifies
 `CImgFileSup::ReadSpan` at `0x8054667`, `BuildNewFileName` at `0x8054BFC`, and
 `OpenImageFile` at `0x8054D41` as the IMG2 file-set implementation.
+`CImage::DecompressLoop` at `0x806AAF4` provides the map/data state machine,
+the `0x8` allocated-run kind, the zero-kind terminator, and map checksum check.
 
 For the pre-IMG2 format, the independently supplied IMAGEL 1.99 binary was
 unpacked and analyzed as IDA database `old_unpacked`. The header recognition

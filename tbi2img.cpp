@@ -126,7 +126,7 @@ static std::vector<uint8_t> decode_deflate(const std::vector<uint8_t>& src,size_
 }
 
 struct Volume { uint32_t sector_size{}; uint64_t start_lba{}, data_offset{}; };
-struct Metadata { uint32_t flags{},compression{}; bool encrypted{}; uint64_t disk_size{}; std::vector<uint8_t> boot_data; std::vector<Volume> volumes; };
+struct Metadata { uint32_t flags{},compression{},format_version{}; bool encrypted{}; uint64_t disk_size{}; std::vector<uint8_t> boot_data; std::vector<Volume> volumes; };
 static Metadata metadata(std::ifstream& in,bool verbose) {
     Metadata m; bool first=true;
     for(;;) {
@@ -134,7 +134,9 @@ static Metadata metadata(std::ifstream& in,bool verbose) {
         if(verbose) std::cerr<<"metadata @"<<off<<" type="<<r.type<<" size="<<r.size<<"\n";
         if(first) {
             if(r.type||r.size!=28||std::memcmp(r.data.data(),"IMG2\0",5)) throw std::runtime_error("not an IMG2 TBI image");
-            m.flags=le32(r.data.data()+16); m.compression=(m.flags&1)?1:(m.flags&0x40)?11:(m.flags&0x20)?14:0; first=false;
+            m.flags=le32(r.data.data()+16); m.format_version=le32(r.data.data()+24);
+            m.compression=(m.flags&1)?1:(m.flags&0x40)?11:(m.flags&0x20)?14:0; first=false;
+            if(verbose) std::cerr<<"IMG2 format=0x"<<std::hex<<m.format_version<<" flags=0x"<<m.flags<<std::dec<<" compression="<<m.compression<<"\n";
         } else if(r.type==6&&!r.data.empty()) m.encrypted=r.data[0]!=0;
         else if(r.type==4&&r.data.size()>=28) {
             uint32_t header_size=le32(r.data.data());
@@ -463,7 +465,10 @@ static void convert(const fs::path& src,const fs::path& dst,bool verbose) {
         uint32_t mix=(uint32_t(sf)<<16)|ef;
         if(header_size==8&&expected!=(tbi_hash(packed.data(),packed.size())^mix)&&expected!=(tbi_hash(expanded.data(),expanded.size())^mix))
             throw std::runtime_error("block checksum mismatch at block "+std::to_string(blocks));
-        if((flagged&0x1ffU)==0) {
+        // The original restore loop distinguishes a map from sector data by
+        // whether an allocated run is outstanding.  Bit 0 of the expanded
+        // size is normally set on maps, but it is not the state machine.
+        if(pending) {
             if(expanded.size()%sector) throw std::runtime_error("data block is not sector aligned");
             uint64_t count=expanded.size()/sector;
             if(pending&&count>pending) throw std::runtime_error("data block exceeds allocated run");
@@ -473,11 +478,24 @@ static void convert(const fs::path& src,const fs::path& dst,bool verbose) {
         } else {
             if(expanded.size()<4) throw std::runtime_error("short run map");
             size_t n=expanded.size()-4;
-            if(n%4||le32(expanded.data()+n)!=tbi_hash(expanded.data(),n)) throw std::runtime_error("run-map checksum mismatch");
-            for(size_t off=0;off<n;off+=4) { uint32_t w=le32(expanded.data()+off),kind=w&0xf0000000U,count=w&0x0fffffffU; if(!w) break;
-                if(!kind) { if(pending) throw std::runtime_error("overlapping allocated runs"); pending=count; }
-                else { if(pending) throw std::runtime_error("skip before allocated data completed"); lba+=count; max_end=std::max(max_end,lba*uint64_t(sector)); }
+            const uint32_t wanted=le32(expanded.data()+n),got=tbi_hash(expanded.data(),n);
+            if(n%4||wanted!=got) throw std::runtime_error("run-map checksum mismatch at block "+std::to_string(blocks)+
+                " (stored="+std::to_string(stored_size)+", expanded="+std::to_string(expanded_size)+
+                ", expected="+std::to_string(wanted)+", calculated="+std::to_string(got)+")");
+            bool terminated=false;
+            for(size_t off=0;off<n;off+=4) {
+                uint32_t w=le32(expanded.data()+off),kind=w&0xf0000000U,count=w&0x0fffffffU;
+                // Image for Linux 2.x DecompressLoop: a zero high nibble ends
+                // the map; 0x8 is allocated data; all other kinds are holes.
+                if(!kind) { terminated=true; break; }
+                if(kind==0x80000000U) {
+                    if(!count) throw std::runtime_error("empty allocated run");
+                    pending=count;
+                    break;
+                }
+                lba+=count; max_end=std::max(max_end,lba*uint64_t(sector));
             }
+            if(!pending&&!terminated) throw std::runtime_error("run map has no allocated run or terminator");
         }
         if(verbose&&!(blocks%4096)) std::cerr<<"blocks="<<blocks<<" written="<<(written>>20)<<" MiB\r";
       }
