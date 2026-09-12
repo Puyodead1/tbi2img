@@ -496,7 +496,9 @@ static void convert(const fs::path& src,const fs::path& dst,bool verbose) {
             const uint32_t wanted=le32(expanded.data()+n),got=tbi_hash(expanded.data(),n);
             if(n%4||wanted!=got) throw std::runtime_error("run-map checksum mismatch at block "+std::to_string(blocks)+
                 " (stored="+std::to_string(stored_size)+", expanded="+std::to_string(expanded_size)+
-                ", expected="+std::to_string(wanted)+", calculated="+std::to_string(got)+")");
+                ", expected="+std::to_string(wanted)+", calculated="+std::to_string(got)+
+                ", word0="+std::to_string(le32(expanded.data()))+
+                ", word1="+std::to_string(expanded.size()>=8?le32(expanded.data()+4):0)+")");
             bool terminated=false; uint64_t cursor=lba;
             for(size_t off=0;off<n;off+=4) {
                 uint32_t w=le32(expanded.data()+off),kind=w&0xf0000000U,count=w&0x0fffffffU;
@@ -549,6 +551,7 @@ int main(int argc,char** argv) {
             std::cerr<<"Usage: tbi2img [--verbose] <input.tbi> <output.img>\n";
             return 2;
         }
+        if(verbose) std::cerr<<"tbi2img decoder revision: img2-v25000-runqueue-1\n";
         convert(positional[0],positional[1],verbose);
         return 0;
     }
