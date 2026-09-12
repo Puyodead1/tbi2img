@@ -172,7 +172,9 @@ static bool control_record(const std::vector<uint8_t>& d,Record& r) {
     r={le32(d.data()),le32(d.data()+4),le32(d.data()+8),{}};
     if(r.type>3||r.size!=d.size()-12) return false;
     r.data.assign(d.begin()+12,d.end());
-    return r.check==((r.type+r.size)^tbi_hash(r.data.data(),r.data.size()));
+    // Stream controls are only record-shaped.  Their third word carries
+    // stream bookkeeping, not the metadata-record payload checksum.
+    return true;
 }
 static void seek_output(std::fstream& out,uint64_t pos) {
     if(pos>uint64_t(std::numeric_limits<std::streamoff>::max())) throw std::runtime_error("output offset too large");

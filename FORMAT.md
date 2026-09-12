@@ -87,6 +87,12 @@ TBI data-stream offset at `236`. A type-2 control record terminates one volume,
 not the entire backup. Whole-disk extraction must independently process every
 volume descriptor into the shared raw image.
 
+Data-stream control blocks use the same 12-byte shape as metadata records, but
+their third word is stream bookkeeping rather than the metadata-record hash.
+The 2.x reader recognizes them when the type is 0 through 3 and the declared
+payload size exactly matches the block size minus 12; type 2 terminates a
+volume and type 3 describes a hole.
+
 File-based split IMG2 sets use the primary name `name.TBI`, followed by
 `name.1`, `name.2`, and so on. Continuations contain raw stream bytes without a
 second metadata header, and any block header or payload may cross a physical
