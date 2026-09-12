@@ -107,6 +107,11 @@ Legacy format `0x27200` with header flags zero uses the bit-oriented codec at
 Its 276-byte volume descriptors retain the sector-size, start-LBA, and stream
 offset fields used by the current format.
 
+For format `0x25000` with header flag `0x1`, every non-control stream block is
+passed through raw DEFLATE, including the uncommon case where its stored and
+expanded sizes are equal. Size equality selects a raw copy only in the older
+bit-oriented compression path.
+
 ## Pre-IMG2 `IMG` format
 
 Image for Linux 1.99 reads an older, partition-oriented format whose signature

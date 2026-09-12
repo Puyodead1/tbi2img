@@ -462,8 +462,12 @@ static void convert(const fs::path& src,const fs::path& dst,bool verbose) {
             continue;
         }
         std::vector<uint8_t> expanded;
-        if(stored_size==expanded_size) expanded=packed;
-        else if(m.compression==1) expanded=decode_deflate(packed,expanded_size);
+        // The 2.x inflate path is used for every non-control block when the
+        // header's compression flag is set, even when stored and expanded
+        // sizes happen to be equal. Only the legacy codec uses equality as
+        // the raw-copy signal.
+        if(m.compression==1) expanded=decode_deflate(packed,expanded_size);
+        else if(stored_size==expanded_size) expanded=packed;
         else if(m.compression==14||m.compression==15) expanded=decode_lz(packed,expanded_size);
         else if(m.compression==0) expanded=decode_legacy(packed,expanded_size);
         else throw std::runtime_error("compressed block in uncompressed image");
@@ -551,7 +555,7 @@ int main(int argc,char** argv) {
             std::cerr<<"Usage: tbi2img [--verbose] <input.tbi> <output.img>\n";
             return 2;
         }
-        if(verbose) std::cerr<<"tbi2img decoder revision: img2-v25000-runqueue-1\n";
+        if(verbose) std::cerr<<"tbi2img decoder revision: img2-v25000-deflateequal-2\n";
         convert(positional[0],positional[1],verbose);
         return 0;
     }
