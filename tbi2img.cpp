@@ -13,6 +13,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "third_party/miniz/miniz_tinfl.h"
 
 namespace fs = std::filesystem;
 static uint16_t le16(const uint8_t* p) { return uint16_t(p[0]) | uint16_t(p[1]) << 8; }
@@ -85,7 +86,7 @@ static std::vector<uint8_t> decode_legacy(const std::vector<uint8_t>& src,size_t
 }
 
 // Raw RFC 1951 DEFLATE used when the IMG2 header's compression flag is 1.
-static std::vector<uint8_t> decode_deflate(const std::vector<uint8_t>& src,size_t out_size) {
+[[maybe_unused]] static std::vector<uint8_t> decode_deflate_reference(const std::vector<uint8_t>& src,size_t out_size) {
     struct Bits {
         const std::vector<uint8_t>& s; size_t p=0;
         uint32_t get(unsigned n) { if(n>24||p+n>s.size()*8) throw std::runtime_error("truncated DEFLATE stream"); uint32_t v=0; for(unsigned i=0;i<n;++i) v|=uint32_t((s[(p+i)>>3]>>((p+i)&7))&1)<<i; p+=n; return v; }
@@ -123,6 +124,15 @@ static std::vector<uint8_t> decode_deflate(const std::vector<uint8_t>& src,size_
         for(;;) { int s=lit.read(bits); if(s<256){if(out.size()==out_size)throw std::runtime_error("DEFLATE output overflow");out.push_back(uint8_t(s));continue;} if(s==256)break; if(s<257||s>285)throw std::runtime_error("invalid DEFLATE length"); unsigned li=unsigned(s-257),len=lbase[li]+bits.get(lextra[li]); int ds=dist.read(bits); if(ds<0||ds>=30)throw std::runtime_error("invalid DEFLATE distance"); size_t d=dbase[ds]+bits.get(dextra[ds]); if(!d||d>out.size()||len>out_size-out.size())throw std::runtime_error("invalid DEFLATE back-reference"); while(len--)out.push_back(out[out.size()-d]); }
     }
     if(out.size()!=out_size) throw std::runtime_error("DEFLATE size mismatch");
+    return out;
+}
+
+static std::vector<uint8_t> decode_deflate(const std::vector<uint8_t>& src,size_t out_size) {
+    std::vector<uint8_t> out(out_size);
+    const size_t actual=tinfl_decompress_mem_to_mem(out.data(),out.size(),src.data(),src.size(),
+        TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+    if(actual==TINFL_DECOMPRESS_MEM_TO_MEM_FAILED) throw std::runtime_error("invalid raw DEFLATE stream");
+    if(actual!=out_size) throw std::runtime_error("DEFLATE size mismatch");
     return out;
 }
 
@@ -462,11 +472,11 @@ static void convert(const fs::path& src,const fs::path& dst,bool verbose) {
             continue;
         }
         std::vector<uint8_t> expanded;
-        // The 2.x inflate path is used for every non-control block when the
-        // header's compression flag is set, even when stored and expanded
-        // sizes happen to be equal. Only the legacy codec uses equality as
-        // the raw-copy signal.
-        if(m.compression==1) expanded=decode_deflate(packed,expanded_size);
+        // The 0x25000 (Image for Linux 2.x) inflate path processes every
+        // non-control block, even when stored and expanded sizes are equal.
+        // Newer IMG2 generations use equality to mark a raw stored block.
+        if(m.compression==1&&(stored_size!=expanded_size||m.format_version<=0x25000U))
+            expanded=decode_deflate(packed,expanded_size);
         else if(stored_size==expanded_size) expanded=packed;
         else if(m.compression==14||m.compression==15) expanded=decode_lz(packed,expanded_size);
         else if(m.compression==0) expanded=decode_legacy(packed,expanded_size);
@@ -555,7 +565,7 @@ int main(int argc,char** argv) {
             std::cerr<<"Usage: tbi2img [--verbose] <input.tbi> <output.img>\n";
             return 2;
         }
-        if(verbose) std::cerr<<"tbi2img decoder revision: img2-v25000-deflateequal-2\n";
+        if(verbose) std::cerr<<"tbi2img decoder revision: img2-miniz-rawinflate-4\n";
         convert(positional[0],positional[1],verbose);
         return 0;
     }

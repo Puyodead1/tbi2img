@@ -110,7 +110,14 @@ offset fields used by the current format.
 For format `0x25000` with header flag `0x1`, every non-control stream block is
 passed through raw DEFLATE, including the uncommon case where its stored and
 expanded sizes are equal. Size equality selects a raw copy only in the older
-bit-oriented compression path.
+bit-oriented compression path and in later IMG2 generations such as `0x33200`.
+
+The Image for Linux 3.41 reader maps header flag `0x1` to internal compression
+mode 2. Its common decompressor at `0x804BDE0` copies blocks when the stored and
+expanded sizes match; otherwise modes 2 through 10 use zlib initialized with
+`windowBits = -15`, i.e. raw RFC 1951 DEFLATE. `tbi2img` uses the vendored miniz
+inflate implementation for this path so the output executable remains
+standalone.
 
 ## Pre-IMG2 `IMG` format
 
@@ -148,6 +155,8 @@ The unpacked binary is `imagel.unpacked`; the IDA database is `imagel_tbi`.
 | `0x809E390` | `tbi_read_file_header` |
 | `0x809EF50` | `tbi_read_volume_records` |
 | `0x809E170` | `tbi_validate_record_stream` |
+| `0x809E390` | v3.41 header reader and compression/header-size selection |
+| `0x804BDE0` | v3.41 common raw-copy/decompression dispatcher |
 
 The Image for Linux 2.x database `v2_split` further identifies
 `CImgFileSup::ReadSpan` at `0x8054667`, `BuildNewFileName` at `0x8054BFC`, and
